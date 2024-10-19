@@ -1,0 +1,141 @@
+!pip install dnspython
+!pip install email-validator
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import pandas as pd
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.colab import files  # Import for file upload
+import re
+import smtplib
+import dns.resolver
+from email_validator import validate_email, EmailNotValidError
+
+# 1. Validate the syntax of the email
+def validate_syntax(email):
+    try:
+        # Validate email syntax
+        valid = validate_email(email)
+        return True, valid.email
+    except EmailNotValidError as e:
+        # Invalid email syntax
+        return False, str(e)
+
+# 2. Validate MX records of the domain
+def validate_mx_record(email):
+    domain = email.split('@')[1]
+    try:
+        # Check MX records of the domain
+        records = dns.resolver.resolve(domain, 'MX')
+        return True, records
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.Timeout, dns.resolver.NoNameservers) as e:
+        return False, f"Domain '{domain}' does not have valid MX records or DNS query failed: {e}"
+
+# 3. SMTP check to verify mailbox existence (without sending an email)
+def validate_smtp(email):
+    domain = email.split('@')[1]
+
+    try:
+        # Get the first MX record of the domain
+        mx_records = dns.resolver.resolve(domain, 'MX')
+        mx_record = str(mx_records[0].exchange)
+
+        # Connect to the mail server
+        server = smtplib.SMTP(timeout=10)
+        server.connect(mx_record)
+        server.helo('test.com')
+        server.mail('test@test.com')  # Sender's address
+        code, message = server.rcpt(email)  # Recipient's address
+
+        server.quit()
+
+        # Check SMTP response code (250 is success)
+        if code == 250:
+            return True, "Mailbox exists."
+        else:
+            return False, f"SMTP validation failed with code {code}."
+
+    except Exception as e:
+        return False, str(e)
+
+# 4. Validate single email
+def validate_single_email(email):
+    syntax_valid, syntax_msg = validate_syntax(email)
+    if not syntax_valid:
+        return {"email": email, "valid": False, "reason": f"Invalid syntax: {syntax_msg}"}
+
+    mx_valid, mx_msg = validate_mx_record(email)
+    if not mx_valid:
+        return {"email": email, "valid": False, "reason": f"MX record issue: {mx_msg}"}
+
+    smtp_valid, smtp_msg = validate_smtp(email)
+    if not smtp_valid:
+        return {"email": email, "valid": False, "reason": f"SMTP issue: {smtp_msg}"}
+
+    return {"email": email, "valid": True, "reason": "Valid email."}
+
+# Function to validate emails with retries
+def validate_single_email_with_retries(email, max_retries=3):
+    result = {'valid': False, 'reason': 'Unknown error'}
+
+    for attempt in range(max_retries):
+        result = validate_single_email(email)
+
+        # If valid or not an SMTP issue, break the loop
+        if result['valid']:
+            break
+        elif 'SMTP issue: Connection unexpectedly closed' in result['reason']:
+            time.sleep(1)  # Optional: Wait before retrying
+        else:
+            break
+
+    return {'email': email, 'validity': "valid" if result['valid'] else "invalid", 'reason': result['reason']}
+
+# Read and validate emails in parallel
+def read_and_validate_excel_parallel(file_path):
+    df = pd.read_excel(file_path)
+    df = df.dropna()
+
+    total_records = len(df)  # Get total number of records
+    counter = 0  # Initialize counter
+
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        futures = [executor.submit(validate_single_email_with_retries, row['email']) for idx, row in df.iterrows()]
+
+        results = []
+        for future in as_completed(futures):
+            result = future.result()
+            counter += 1  # Increment counter for each processed record
+            print(f"Processed {counter}/{total_records} emails")  # Log the progress
+            results.append(result)
+
+    # Update the DataFrame with the validation results
+    for result in results:
+        df.loc[df['email'] == result['email'], 'validity'] = result['validity']
+        df.loc[df['email'] == result['email'], 'reason'] = result['reason']
+
+    return df
+
+# Save the updated DataFrame to a new Excel file
+def save_validated_excel(df, output_file):
+    # Replace specific values in the 'reason' column
+    df['reason'] = df['reason'].replace(
+        "SMTP issue: Connection unexpectedly closed",
+        "simple validation and domain check passed, could not process smtp check"
+    )
+
+    # Save the DataFrame to an Excel file
+    df.to_excel(output_file, index=False)
+
+
+input_file = '/content/sample_data/Batch_5.xlsx'  # The uploaded file's name
+output_file = '/content/sample_data/Batch5_validated.xlsx'  # Path for the output file
+
+# Validate and save the Excel
+df_validated = read_and_validate_excel_parallel(input_file)
+save_validated_excel(df_validated, output_file)
+
+print(f"Validated emails saved to {output_file}")
